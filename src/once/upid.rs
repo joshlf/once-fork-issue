@@ -3,6 +3,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static UPID: AtomicUsize = AtomicUsize::new(<usize>::max_value());
 
+/// Get the current process' UPID.
+///
+/// The UPID (Unique Process ID) is an identifier used to distinguish a process (that has been
+/// forked but has not exec'd) from its parent process. A process' UPID is guaranteed to be
+/// distinct from the UPIDs of any of its ancestors with two important caveats:
+/// * The UPID is not guaranteed to be distinct from non-ancestors such as sibling processes.
+/// * The UPID is not guaranteed to be distinct from ancestors that called exec. To be precise, the
+///   UPID is only guaranteed to be distinct from the UPID of a process that begat this process
+///   via a series of calls to `fork` without any intervening calls to `exec`.
 pub fn upid() -> usize {
     let upid = UPID.load(Ordering::Relaxed);
     if upid != <usize>::max_value() {
