@@ -95,6 +95,12 @@ pub struct Once {
     // This `state` word is actually an encoded version of just a pointer to a
     // `Waiter`, so we add the `PhantomData` appropriately.
     state: AtomicUsize,
+    // The UPID of the process that transitioned this Once into the RUNNING state.
+    // Note that it's VERY important that upid be updated BEFORE transitioning into
+    // the RUNNING state. This allows a thread that observes the RUNNING state and
+    // then observes upid to be confident that the value for upid it observed is
+    // the one that was stored by the thread that transitioned the Once into the
+    // RUNNING state.
     upid: AtomicUsize,
     _marker: marker::PhantomData<*mut Waiter>,
 }
@@ -114,7 +120,8 @@ unsafe impl Send for Once {}
 // #[unstable(feature = "once_poison", issue = "33577")]
 #[derive(Debug)]
 pub struct OnceState {
-    poisoned: bool,
+    poisoned_panic: bool,
+    poisoned_fork: bool,
 }
 
 /// Initialization value for static [`Once`] values.
@@ -131,18 +138,21 @@ pub struct OnceState {
 // #[stable(feature = "rust1", since = "1.0.0")]
 pub const ONCE_INIT: Once = Once::new();
 
-// Four states that a Once can be in, encoded into the lower bits of `state` in
+// Five states that a Once can be in, encoded into the lower 3 bits of `state` in
 // the Once structure.
 const INCOMPLETE: usize = 0x0;
-const POISONED: usize = 0x1;
-const RUNNING: usize = 0x2;
-const COMPLETE: usize = 0x3;
+const POISONED_PANIC: usize = 0x1;
+const POISONED_FORK: usize = 0x2;
+const RUNNING: usize = 0x3;
+const COMPLETE: usize = 0x4;
 
 // Mask to learn about the state. All other bits are the queue of waiters if
 // this is in the RUNNING state.
-const STATE_MASK: usize = 0x3;
+const STATE_MASK: usize = 0b111;
 
 // Representation of a node in the linked list of waiters in the RUNNING state.
+// Aligned to 16 to ensure that the lower 3 bits are available for encoding state.
+#[repr(align(16))]
 struct Waiter {
     thread: Option<Thread>,
     signaled: AtomicBool,
@@ -263,7 +273,7 @@ impl Once {
         }
 
         let mut f = Some(f);
-        self.call_inner(true, &mut |p| f.take().unwrap()(&OnceState { poisoned: p }));
+        self.call_inner(true, &mut |state| f.take().unwrap()(&state));
     }
 
     // This is a non-generic function to reduce the monomorphization cost of
@@ -278,7 +288,7 @@ impl Once {
     // currently no way to take an `FnOnce` and call it via virtual dispatch
     // without some allocation overhead.
     #[cold]
-    fn call_inner(&'static self, ignore_poisoning: bool, mut init: &mut FnMut(bool)) {
+    fn call_inner(&'static self, ignore_poisoning: bool, mut init: &mut FnMut(OnceState)) {
         let mut state = self.state.load(Ordering::SeqCst);
         // Load it once at the beginning for efficiency (upid::upid invokes an atomic load).
         let upid = upid::upid();
@@ -291,20 +301,34 @@ impl Once {
 
                 // If we're poisoned and we're not in a mode to ignore
                 // poisoning, then we panic here to propagate the poison.
-                POISONED if !ignore_poisoning => {
-                    panic!("Once instance has previously been poisoned");
+                POISONED_PANIC if !ignore_poisoning => {
+                    panic!("Once instance has previously been poisoned by a function panicking");
+                }
+                POISONED_FORK if !ignore_poisoning => {
+                    panic!("Once instance has previously been poisoned by the process forking");
                 }
 
-                // Otherwise if we see a poisoned or otherwise incomplete state
-                // we will attempt to move ourselves into the RUNNING state. If
-                // we succeed, then the queue of waiters starts at null (all 0
-                // bits).
-                POISONED | INCOMPLETE => {
+                // If we're in the INCOMPLETE state - or we're poisoned and not ignoring poisons -
+                // then we will attempt to move ourselves into the RUNNING state. If we succeed,
+                // then the queue of waiters starts at null (all 0 bits).
+                POISONED_PANIC | POISONED_FORK | INCOMPLETE => {
+                    // First, make sure that the stored UPID is the UPID
+                    // of this process. It's very important that we update
+                    // this BEFORE we transition the state to RUNNING -
+                    // this allows a thread that observes the RUNNING state
+                    // and then loads the UPID to be confident that the UPID
+                    // it loads is the UPID of the thread that performed the
+                    // transition to RUNNING (us).
                     let stored_upid = self.upid.load(Ordering::SeqCst);
                     if stored_upid != upid {
                         let old_upid = self.upid
                             .compare_and_swap(stored_upid, upid, Ordering::SeqCst);
                         if old_upid != stored_upid {
+                            // If we failed to CAS, then somebody else succeeded. It's technically
+                            // possible that it'd be OK for us not to retry the loop here (that is,
+                            // it's possible that we'd still be guaranteed that the UPID is
+                            // correct), but that's some pretty subtle logic, so it's much safer to
+                            // just retry the loop to be safe.
                             continue;
                         }
                     }
@@ -326,7 +350,10 @@ impl Once {
                         upid: upid,
                         me: self,
                     };
-                    init(state == POISONED);
+                    init(OnceState {
+                             poisoned_panic: state == POISONED_PANIC,
+                             poisoned_fork: state == POISONED_FORK,
+                         });
                     complete.panicked = false;
                     return;
                 }
@@ -337,63 +364,47 @@ impl Once {
                 // head of the list and bail out if we ever see a state that's
                 // not RUNNING.
                 _ => {
+                    assert!(state & STATE_MASK == RUNNING);
                     let stored_upid = self.upid.load(Ordering::SeqCst);
-                    if stored_upid == upid {
-                        assert!(state & STATE_MASK == RUNNING);
-                        let mut node = Waiter {
-                            thread: Some(thread::current()),
-                            signaled: AtomicBool::new(false),
-                            upid: upid,
-                            next: ptr::null_mut(),
-                        };
-                        let me = &mut node as *mut Waiter as usize;
-                        assert!(me & STATE_MASK == 0);
-
-                        while state & STATE_MASK == RUNNING {
-                            node.next = (state & !STATE_MASK) as *mut Waiter;
-                            let old = self.state
-                                .compare_and_swap(state, me | RUNNING, Ordering::SeqCst);
-                            if old != state {
-                                state = old;
-                                continue;
-                            }
-
-                            // Once we've enqueued ourselves, wait in a loop.
-                            // Afterwards reload the state and continue with what we
-                            // were doing from before.
-                            while !node.signaled.load(Ordering::SeqCst) {
-                                thread::park();
-                            }
-                            state = self.state.load(Ordering::SeqCst);
-                            continue 'outer;
-                        }
-                    } else {
-                        let old_upid = self.upid
-                            .compare_and_swap(stored_upid, upid, Ordering::SeqCst);
-                        if old_upid != stored_upid {
-                            continue;
-                        }
-
+                    if stored_upid != upid {
+                        // The thread that transitioned us into the RUNNING state is in an ancestor
+                        // process, so attempt to CAS us into the POISONED_FORK state. Regardless
+                        // of whether we succeed, we're no longer guaranteed to be in the RUNNING
+                        // state, so retry the loop.
                         let old = self.state
-                            .compare_and_swap(state, RUNNING, Ordering::SeqCst);
+                            .compare_and_swap(state, POISONED_FORK, Ordering::SeqCst);
+                        if old != state {
+                            state = old;
+                        }
+                        continue;
+                    }
+
+                    let mut node = Waiter {
+                        thread: Some(thread::current()),
+                        signaled: AtomicBool::new(false),
+                        upid: upid,
+                        next: ptr::null_mut(),
+                    };
+                    let me = &mut node as *mut Waiter as usize;
+                    assert!(me & STATE_MASK == 0);
+
+                    while state & STATE_MASK == RUNNING {
+                        node.next = (state & !STATE_MASK) as *mut Waiter;
+                        let old = self.state
+                            .compare_and_swap(state, me | RUNNING, Ordering::SeqCst);
                         if old != state {
                             state = old;
                             continue;
                         }
 
-                        // Run the initialization routine, letting it know if we're
-                        // poisoned or not. The `Finish` struct is then dropped, and
-                        // the `Drop` implementation here is responsible for waking
-                        // up other waiters both in the normal return and panicking
-                        // case.
-                        let mut complete = Finish {
-                            panicked: true,
-                            upid: upid,
-                            me: self,
-                        };
-                        init(state == POISONED);
-                        complete.panicked = false;
-                        return;
+                        // Once we've enqueued ourselves, wait in a loop.
+                        // Afterwards reload the state and continue with what we
+                        // were doing from before.
+                        while !node.signaled.load(Ordering::SeqCst) {
+                            thread::park();
+                        }
+                        state = self.state.load(Ordering::SeqCst);
+                        continue 'outer;
                     }
                 }
             }
@@ -413,7 +424,7 @@ impl Drop for Finish {
         // Swap out our state with however we finished. We should only ever see
         // an old state which was RUNNING.
         let queue = if self.panicked {
-            self.me.state.swap(POISONED, Ordering::SeqCst)
+            self.me.state.swap(POISONED_PANIC, Ordering::SeqCst)
         } else {
             self.me.state.swap(COMPLETE, Ordering::SeqCst)
         };
@@ -424,11 +435,10 @@ impl Drop for Finish {
         // in the node it can be free'd! As a result we load the `thread` to
         // signal ahead of time and then unpark it after the store.
         unsafe {
-            let upid = upid::upid();
             let mut queue = (queue & !STATE_MASK) as *mut Waiter;
             while !queue.is_null() {
                 let next = (*queue).next;
-                if (*queue).upid == upid {
+                if (*queue).upid == self.upid {
                     let thread = (*queue).thread.take().unwrap();
                     (*queue).signaled.store(true, Ordering::SeqCst);
                     thread.unpark();
@@ -440,7 +450,7 @@ impl Drop for Finish {
 }
 
 impl OnceState {
-    /// Returns whether the associated [`Once`] has been poisoned.
+    /// Returns whether the associated [`Once`] has been poisoned due to panicking or forking.
     ///
     /// Once an initalization routine for a [`Once`] has panicked it will forever
     /// indicate to future forced initialization routines that it is poisoned.
@@ -448,7 +458,27 @@ impl OnceState {
     /// [`Once`]: struct.Once.html
     // #[unstable(feature = "once_poison", issue = "33577")]
     pub fn poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned_panic || self.poisoned_fork
+    }
+
+    /// Returns whether the associated [`Once`] has been poisoned due to panicking.
+    ///
+    /// Once an initalization routine for a [`Once`] has panicked it will forever
+    /// indicate to future forced initialization routines that it is poisoned.
+    ///
+    /// [`Once`]: struct.Once.html
+    pub fn poisoned_panic(&self) -> bool {
+        self.poisoned_panic
+    }
+
+    /// Returns whether the associated [`Once`] has been poisoned due to forking.
+    ///
+    /// Once an initalization routine for a [`Once`] has panicked it will forever
+    /// indicate to future forced initialization routines that it is poisoned.
+    ///
+    /// [`Once`]: struct.Once.html
+    pub fn poisoned_fork(&self) -> bool {
+        self.poisoned_fork
     }
 }
 

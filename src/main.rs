@@ -1,4 +1,6 @@
 #![feature(const_fn)]
+#![feature(repr_align)]
+#![feature(attr_literals)]
 
 mod once;
 
