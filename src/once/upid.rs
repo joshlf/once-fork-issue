@@ -6,13 +6,26 @@ static UPID: AtomicUsize = AtomicUsize::new(<usize>::max_value());
 /// Get the current process' UPID.
 ///
 /// The UPID (Unique Process ID) is an identifier used to distinguish a process (that has been
-/// forked but has not exec'd) from its parent process. A process' UPID is guaranteed to be
+/// forked but has not exec'd) from its ancestor processes. A process' UPID is guaranteed to be
 /// distinct from the UPIDs of any of its ancestors with two important caveats:
 /// * The UPID is not guaranteed to be distinct from non-ancestors such as sibling processes.
 /// * The UPID is not guaranteed to be distinct from ancestors that called exec. To be precise, the
 ///   UPID is only guaranteed to be distinct from the UPID of a process that begat this process
 ///   via a series of calls to `fork` without any intervening calls to `exec`.
 pub fn upid() -> usize {
+    // The Relaxed ordering is sufficient here because the only times that UPID can be modified are
+    // at initialization (after this if block) and after a fork (the atfork callback).
+    // * If we are the first process, then even if we fail to observe a previous store to UPID,
+    //   that's fine - UPID can only either be <usize>::max_value() or 0. In the former case, we'll
+    //   register the atfork callback (see the comment below for why this is safe) and CAS UPID to
+    //   0 (and if this fails, then somebody else succeeded, so who cares). In the latter case,
+    //   then we observed the correct value.
+    // * If we are not the first process, then this call to upid must happen after the atfork
+    //   callback is invoked. Either we're in the same thread that the atfork callback was called
+    //   in - in which case we obviously observe the result of UPID being incremented in atfork -
+    //   or we're in a thread that was spawned from the thread that called atfork - in which case
+    //   we still observe the result of UPID being incremented because all events in a thread
+    //   prior to spawning a new thread HAPPEN BEFORE all events in the spawned thread.
     let upid = UPID.load(Ordering::Relaxed);
     if upid != <usize>::max_value() {
         return upid;
